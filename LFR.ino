@@ -1,36 +1,35 @@
-// variable to store sensor value 
 int a, b, c, d, e;
 
-// Variables for storing IR sensor
+
 int svel, svl, svc, svr, sver;
 
-// Pin definition
+
 int svelPin = A1;
 int svlPin = A2;
 int svcPin = A3;
 int svrPin = A4;
 int sverPin = A5;
 
-// PID variables
-float Kp = 0.6;   // Proportional gain
-float Ki = 0.1;   // Integral gain
-float Kd = 0.2;   // Derivative gain
+
+float Kp = 0.6;  
+float Ki = 0.1;   
+float Kd = 0.2;   
 
 float error = 0, previousError = 0;
 float integral = 0;
 float derivative = 0;
 float correction = 0;
 
-// Base motor speed
+
 int baseSpeed = 70;
 
-// PWM pins for motor control
-const int enA = 9; // Left motor
-const int enB = 3; // Right motor
 
-// Direction control pins
-const int in1 = 10, in2 = 11; // Left motor
-const int in3 = 5, in4 = 4;   // Right motor
+const int enA = 9; 
+const int enB = 3; 
+
+
+const int in1 = 10, in2 = 11; 
+const int in3 = 5, in4 = 4;   
 
 void setup() {
   Serial.begin(9600);
@@ -50,42 +49,42 @@ void setup() {
 }
 
 void loop() {
-  // Read sensor values
+  
   svel = analogRead(svelPin);
   svl = analogRead(svlPin);
   svc = analogRead(svcPin);
   svr = analogRead(svrPin);
   sver = analogRead(sverPin);
 
-  // Convert sensor readings to binary (line detected or not)
+
   a = (svel < 50) ? 0 : 1;
   b = (svl < 50) ? 0 : 1;
   c = (svc < 50) ? 0 : 1;
   d = (svr < 50) ? 0 : 1;
   e = (sver < 50) ? 0 : 1;
 
-  // Calculate error based on sensor values
+  
   error = (-2 * a) + (-1 * b) + (0 * c) + (1 * d) + (2 * e);
 
-  // Calculate PID terms
-  integral += error; // Accumulate the error for the integral term
-  derivative = error - previousError; // Change in error for the derivative term
+  
+  integral += error; 
+  derivative = error - previousError; 
 
-  // PID correction
+ 
   correction = (Kp * error) + (Ki * integral) + (Kd * derivative);
 
-  // Update previous error for the next loop
+  
   previousError = error;
 
-  // Adjust motor speeds
+  
   int leftMotorSpeed = baseSpeed + correction;
   int rightMotorSpeed = baseSpeed - correction;
 
-  // Constrain motor speeds to valid range (0-255)
+  
   leftMotorSpeed = constrain(leftMotorSpeed, 0, 255);
   rightMotorSpeed = constrain(rightMotorSpeed, 0, 255);
 
-  // Move the robot
+  
   moveMotors(leftMotorSpeed, rightMotorSpeed);
 }
 
