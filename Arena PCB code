@@ -1,0 +1,347 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <SPI.h>
+#include <LittleFS.h>
+#include "HX711.h"
+
+#define FSYS LittleFS
+
+const unsigned long PUMP_MAX_TIME_MS = 5000; 
+const int           PUMP_TARGET_ML   = 125; 
+const char*         IMAGE_PATH       = "/image.bmp";
+
+const float CALIBRATION_FACTOR = -7050.0f;
+const float GRAMS_PER_ML       = 1.0f;    
+
+#define IR1_PIN 32
+#define IR2_PIN 33
+#define IR3_PIN 25
+#define RELAY1_PIN 13
+#define RELAY2_PIN 14  
+#define TFT_CS   15
+#define TFT_RST  17
+#define TFT_A0   16
+#define TFT_SDA  23
+#define TFT_SCLK 18
+
+// HX711 pins
+#define HX711_DOUT 26
+#define HX711_SCK  27
+
+// TFT object
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_A0, TFT_SDA, TFT_SCLK, TFT_RST);
+
+// HX711 object
+HX711 scale;
+
+// Relay control
+#define RELAY_ON  HIGH
+#define RELAY_OFF LOW
+
+bool ir1_detected = false;
+bool ir2_detected = false;
+bool ir3_detected = false;
+unsigned long pump_start_time = 0;
+unsigned long lastIR1Time = 0;
+unsigned long lastIR2Time = 0;
+unsigned long lastIR3Time = 0;
+const unsigned long debounceDelay = 100;
+
+bool pumpScreenActive = false;
+
+const int BEAKER_X = 40;
+const int BEAKER_Y = 25;
+const int BEAKER_W = 60;
+const int BEAKER_H = 80;
+
+void displayStatus();
+void drawPumpScreenBase();
+void updatePumpAnimationWithLoadCell(float ml, float fraction, bool done);
+void displayImageFromFS();
+uint16_t read16(File &f);
+uint32_t read32(File &f);
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  if (!FSYS.begin(true)) {
+    Serial.println("LittleFS Mount Failed!");
+    Serial.println("If first time, upload data (image.bmp) then reset.");
+  } else {
+    if (FSYS.exists(IMAGE_PATH)) {
+      File file = FSYS.open(IMAGE_PATH, "r");
+      file.close();
+    } else {
+      Serial.println("Upload image.bmp using LittleFS data upload tool.");
+    }
+  }
+  Serial.println();
+
+  pinMode(IR1_PIN, INPUT_PULLUP);
+  pinMode(IR2_PIN, INPUT_PULLUP);
+  pinMode(IR3_PIN, INPUT_PULLUP);
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  digitalWrite(RELAY1_PIN, RELAY_OFF);
+  digitalWrite(RELAY2_PIN, RELAY_OFF);
+
+  scale.begin(HX711_DOUT, HX711_SCK);
+  scale.set_scale(CALIBRATION_FACTOR);
+  scale.tare();
+
+  // ---- TFT ----
+  Serial.println("Initializing TFT...");
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(1);
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(15, 30);
+  tft.println("SYSTEM");
+  tft.setCursor(20, 50);
+  tft.println("READY!");
+
+  Serial.println("System Ready!\n");
+  delay(2000);
+  displayStatus();
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  bool statusChanged = false;
+
+  int ir1State = digitalRead(IR1_PIN);
+  int ir2State = digitalRead(IR2_PIN);
+  int ir3State = digitalRead(IR3_PIN);
+
+  if (ir1State == LOW && !ir1_detected) {
+    if (currentTime - lastIR1Time > debounceDelay) {
+      ir1_detected = true;
+      digitalWrite(RELAY1_PIN, RELAY_ON);
+      pump_start_time = currentTime;
+      lastIR1Time = currentTime;
+      pumpScreenActive = true;
+
+      drawPumpScreenBase();
+    }
+  }
+
+  if (pumpScreenActive && (digitalRead(RELAY1_PIN) == RELAY_ON)) {
+    float grams = 0.0f;
+    if (scale.is_ready()) {
+      grams = scale.get_units(3);  // number of samples
+    }
+
+    float ml = grams / GRAMS_PER_ML;
+    if (ml < 0) ml = 0;
+
+    float fraction = ml / (float)PUMP_TARGET_ML;
+    if (fraction > 1.0f) fraction = 1.0f;
+    if (fraction < 0.0f) fraction = 0.0f;
+
+    bool reachedTarget = (ml >= PUMP_TARGET_ML);
+    bool timeout       = ((currentTime - pump_start_time) >= PUMP_MAX_TIME_MS);
+
+    updatePumpAnimationWithLoadCell(ml, fraction, reachedTarget || timeout);
+
+    if (reachedTarget || timeout) {
+      digitalWrite(RELAY1_PIN, RELAY_OFF);
+      pumpScreenActive = false;
+      Serial.print("    Relay 1 (PUMP) OFF, reason: ");
+      if (reachedTarget) Serial.println("target volume reached.");
+      else               Serial.println("timeout.");
+
+      statusChanged = true;
+    }
+  }
+
+  if (ir2State == LOW && !ir2_detected) {
+    if (currentTime - lastIR2Time > debounceDelay) {
+      ir2_detected = true;
+      digitalWrite(RELAY2_PIN, RELAY_ON);
+      lastIR2Time = currentTime;
+      statusChanged = true;
+      Serial.println(">>> IR2 DETECTED! Relay 2 ON PERMANENTLY");
+    }
+  }
+
+  if (ir3State == LOW && !ir3_detected) {
+    if (currentTime - lastIR3Time > debounceDelay) {
+      ir3_detected = true;
+      lastIR3Time = currentTime;
+      statusChanged = true;
+      Serial.println(">>> IR3 DETECTED! Displaying image");
+      displayImageFromFS();
+      return;
+    }
+  }
+
+  if (statusChanged && !pumpScreenActive) {
+    displayStatus();
+  }
+
+  delay(40);
+}
+
+void displayStatus() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(10, 5);
+  tft.println("== SYSTEM STATUS ==");
+
+  tft.setCursor(5, 25);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("IR1:");
+  tft.setCursor(40, 25);
+  tft.setTextColor(ir1_detected ? ST77XX_GREEN : ST77XX_RED);
+  tft.println(ir1_detected ? "DETECTED" : "CLEAR");
+
+  tft.setCursor(5, 38);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.print("Relay1:");
+  tft.setCursor(60, 38);
+  tft.setTextColor(digitalWrite, digitalRead(RELAY1_PIN) ? ST77XX_GREEN : ST77XX_RED);
+  tft.println(digitalRead(RELAY1_PIN) ? "ON" : "OFF");
+
+  tft.drawLine(5, 52, 155, 52, ST77XX_BLUE);
+
+  tft.setCursor(5, 60);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("IR2:");
+  tft.setCursor(40, 60);
+  tft.setTextColor(ir2_detected ? ST77XX_GREEN : ST77XX_RED);
+  tft.println(ir2_detected ? "DETECTED" : "CLEAR");
+
+  tft.setCursor(5, 73);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.print("Relay2:");
+  tft.setCursor(60, 73);
+  tft.setTextColor(digitalRead(RELAY2_PIN) ? ST77XX_GREEN : ST77XX_RED);
+  tft.println(digitalRead(RELAY2_PIN) ? "ON" : "OFF");
+
+  tft.drawLine(5, 87, 155, 87, ST77XX_BLUE);
+
+  tft.setCursor(5, 95);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("IR3:");
+  tft.setCursor(40, 95);
+  tft.setTextColor(ir3_detected ? ST77XX_GREEN : ST77XX_RED);
+  tft.println(ir3_detected ? "DETECTED" : "CLEAR");
+
+  tft.drawRect(1, 1, 158, 126, ST77XX_WHITE);
+}
+
+void drawPumpScreenBase() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  tft.setTextSize(2);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.setCursor(15, 5);
+  tft.println("PUMPING");
+
+  tft.setTextSize(1);
+  tft.setCursor(10, 20);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("Target: ");
+  tft.print(PUMP_TARGET_ML);
+  tft.println(" ml");
+
+  tft.drawRect(BEAKER_X, BEAKER_Y, BEAKER_W, BEAKER_H, ST77XX_WHITE);
+
+  tft.setCursor(10, 110);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.print("Volume: 0 ml");
+}
+
+void updatePumpAnimationWithLoadCell(float ml, float fraction, bool done) {
+  tft.fillRect(BEAKER_X + 1, BEAKER_Y + 1, BEAKER_W - 2, BEAKER_H - 2, ST77XX_BLACK);
+
+  if (fraction < 0.0f) fraction = 0.0f;
+  if (fraction > 1.0f) fraction = 1.0f;
+  int fillHeight = (int)(fraction * (BEAKER_H - 2));
+  int fillY      = BEAKER_Y + BEAKER_H - 1 - fillHeight;
+
+  if (fillHeight > 0) {
+    tft.fillRect(BEAKER_X + 1, fillY, BEAKER_W - 2, fillHeight, ST77XX_BLUE);
+  }
+
+  tft.drawRect(BEAKER_X, BEAKER_Y, BEAKER_W, BEAKER_H, ST77XX_WHITE);
+
+  tft.fillRect(10, 110, 140, 10, ST77XX_BLACK);  // clear old text
+  tft.setCursor(10, 110);
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.print("Volume: ");
+  tft.print((int)ml);
+  tft.print(" ml");
+
+  if (done) {
+    tft.setCursor(10, 95);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.print("DONE");
+  }
+}
+
+void displayImageFromFS() {
+  tft.fillScreen(ST77XX_BLACK);
+
+  if (!FSYS.begin()) {
+    tft.setTextColor(ST77XX_RED);
+    tft.setTextSize(2);
+    tft.setCursor(10, 50);
+    tft.println("FS ERROR");
+    return;
+  }
+
+  File bmpFile = FSYS.open(IMAGE_PATH, "r");
+
+  if (read16(bmpFile) == 0x4D42) { 
+    (void)read32(bmpFile);          
+    (void)read32(bmpFile);          
+    uint32_t imageOffset = read32(bmpFile);
+    (void)read32(bmpFile);         
+    int bmpWidth  = read32(bmpFile);
+    int bmpHeight = read32(bmpFile);
+
+    if (read16(bmpFile) == 1) {
+      uint16_t depth = read16(bmpFile);
+
+      if (depth == 24 && read32(bmpFile) == 0) {
+        Serial.println("Loading BMP from LittleFS...");
+
+        uint32_t rowSize = (bmpWidth * 3 + 3) & ~3;
+        uint8_t buffer[rowSize];
+
+        for (int row = bmpHeight - 1; row >= 0; row--) {
+          bmpFile.seek(imageOffset + row * rowSize);
+          bmpFile.read(buffer, rowSize);
+
+          for (int col = 0; col < bmpWidth && col < 160; col++) {
+            uint8_t b = buffer[col * 3];
+            uint8_t g = buffer[col * 3 + 1];
+            uint8_t r = buffer[col * 3 + 2];
+
+            if (row < 128) {
+              tft.drawPixel(col, row, tft.color565(r, g, b));
+            }
+          }
+        }
+
+        Serial.println("Image displayed successfully!");
+      } else {
+        tft.setTextColor(ST77XX_RED);
+        tft.setCursor(5, 50);
+        tft.println("Use 24-bit BMP!");
+      }
+    }
+  }
+
+  bmpFile.close();
+}
+
+uint16_t read16(File &f) {
+  uint16_t result;
+  ((uint8_t *)&result)[0] = f.read();
+  ((uint8_t *)&result)[1] = f.read();
+  return result;
+}
