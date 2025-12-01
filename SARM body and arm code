@@ -1,0 +1,336 @@
+#include <Arduino.h>
+#include <Bluepad32.h>
+#include <ESP32Servo.h>
+
+// ================= SERVO PIN DEFINITIONS =================
+#define PIN_GRIPPER   27
+#define PIN_WRIST     32
+#define PIN_ELBOW     33
+#define PIN_SHOULDER  12
+#define PIN_BASE      17   // Base servo
+
+// ================= MOTOR DRIVER PIN DEFINITIONS =================
+// LEFT SIDE (L298N side, not physical bot-left)
+#define LEFT_ENA  5
+#define LEFT_IN1  18
+#define LEFT_IN2  19
+#define LEFT_IN3  21
+#define LEFT_IN4  22
+#define LEFT_ENB  23
+
+// RIGHT SIDE (L298N side)
+#define RIGHT_ENA  25
+#define RIGHT_IN1  15
+#define RIGHT_IN2  2
+#define RIGHT_IN3  14
+#define RIGHT_IN4  4
+#define RIGHT_ENB  26
+
+// ================= MOTOR CALIBRATION =================
+#define LEFT_SPEED_FACTOR   1.0
+#define RIGHT_SPEED_FACTOR  1.0
+
+// ================= PWM SETTINGS =================
+#define PWM_FREQ              1000
+#define PWM_RESOLUTION        8
+#define PWM_CHANNEL_LEFT_ENA   12
+#define PWM_CHANNEL_LEFT_ENB   13
+#define PWM_CHANNEL_RIGHT_ENA  14
+#define PWM_CHANNEL_RIGHT_ENB  15
+
+// ================= SERVO OBJECTS =================
+Servo servoGripper;
+Servo servoWrist;
+Servo servoElbow;
+Servo servoShoulder;
+Servo servoBase;
+
+// ================= GAMEPAD =================
+ControllerPtr myControllers[BP32_MAX_GAMEPADS] = { nullptr };
+
+// ================= SERVO POSITIONS =================
+int posBase     = 90;
+int posShoulder = 90;
+int posElbow    = 90;
+int posWrist    = 90;
+int posGripper  = 90;
+
+// ================= GAMEPAD CONTROL SETTINGS =================
+#define DEADZONE_X_MIN  -200
+#define DEADZONE_X_MAX   200
+#define DEADZONE_Y_MIN  -200
+#define DEADZONE_Y_MAX   200
+
+#define SERVO_SPEED    3
+#define MOTOR_SPEED    255
+#define MIN_MOTOR_PWM  70
+
+// ================= MOTOR CONTROL FUNCTIONS =================
+void stopAllMotors() {
+  digitalWrite(LEFT_IN1, LOW);  digitalWrite(LEFT_IN2, LOW);
+  digitalWrite(LEFT_IN3, LOW);  digitalWrite(LEFT_IN4, LOW);
+  digitalWrite(RIGHT_IN1, LOW); digitalWrite(RIGHT_IN2, LOW);
+  digitalWrite(RIGHT_IN3, LOW); digitalWrite(RIGHT_IN4, LOW);
+
+  ledcWrite(PWM_CHANNEL_LEFT_ENA, 0);
+  ledcWrite(PWM_CHANNEL_LEFT_ENB, 0);
+  ledcWrite(PWM_CHANNEL_RIGHT_ENA, 0);
+  ledcWrite(PWM_CHANNEL_RIGHT_ENB, 0);
+}
+
+// NOTE: physical LEFT = RIGHT_ENA + RIGHT_ENB
+//       physical RIGHT = LEFT_ENA + LEFT_ENB
+void setMotorSpeed(int speed) {
+  speed = constrain(speed, 0, 255);
+
+  int leftSpeed  = (int)(speed * LEFT_SPEED_FACTOR);
+  int rightSpeed = (int)(speed * RIGHT_SPEED_FACTOR);
+
+  // PHYSICAL LEFT SIDE  (LF = M3, LB = M4) → RIGHT_ENA + RIGHT_ENB
+  ledcWrite(PWM_CHANNEL_RIGHT_ENA, leftSpeed);   // LF
+  ledcWrite(PWM_CHANNEL_RIGHT_ENB, leftSpeed);   // LB
+
+  // PHYSICAL RIGHT SIDE (RF = M2, RB = M1) → LEFT_ENB + LEFT_ENA
+  ledcWrite(PWM_CHANNEL_LEFT_ENA,  rightSpeed);  // RB
+  ledcWrite(PWM_CHANNEL_LEFT_ENB,  rightSpeed);  // RF
+}
+
+int mapJoystickToSpeed(int joystickValue) {
+  int absValue = abs(joystickValue);
+  if (absValue <= 200) return 0;  // deadzone
+
+  int pwm = map(absValue, 200, 500, MIN_MOTOR_PWM, 255);
+  return constrain(pwm, 0, 255);
+}
+// Forward: physical LEFT forward, physical RIGHT forward
+void moveForward(int speed) {
+  setMotorSpeed(speed);
+
+  // PHYSICAL LEFT SIDE (LF + LB) = M3 + M4 (RIGHT_* pins) forward
+  digitalWrite(RIGHT_IN1, HIGH); digitalWrite(RIGHT_IN2, LOW);  // M3 = LF
+  digitalWrite(RIGHT_IN3, HIGH); digitalWrite(RIGHT_IN4, LOW);  // M4 = LB
+
+  // PHYSICAL RIGHT SIDE (RF + RB) = M2 + M1 (LEFT_* pins) forward
+  digitalWrite(LEFT_IN3, HIGH);  digitalWrite(LEFT_IN4, LOW);   // M2 = RF
+  digitalWrite(LEFT_IN1, HIGH);  digitalWrite(LEFT_IN2, LOW);   // M1 = RB
+}
+
+// Backward: physical LEFT backward, physical RIGHT backward
+void moveBackward(int speed) {
+  setMotorSpeed(speed);
+
+  // PHYSICAL LEFT SIDE backward
+  digitalWrite(RIGHT_IN1, LOW);  digitalWrite(RIGHT_IN2, HIGH); // LF
+  digitalWrite(RIGHT_IN3, LOW);  digitalWrite(RIGHT_IN4, HIGH); // LB
+
+  // PHYSICAL RIGHT SIDE backward
+  digitalWrite(LEFT_IN3, LOW);   digitalWrite(LEFT_IN4, HIGH);  // RF
+  digitalWrite(LEFT_IN1, LOW);   digitalWrite(LEFT_IN2, HIGH);  // RB
+}
+
+// Pivot left: physical LEFT backward, physical RIGHT forward
+void turnLeft(int speed) {
+  setMotorSpeed(speed);
+
+  // PHYSICAL LEFT SIDE (LF + LB) backward
+  digitalWrite(RIGHT_IN1, LOW);  digitalWrite(RIGHT_IN2, HIGH); // LF
+  digitalWrite(RIGHT_IN3, LOW);  digitalWrite(RIGHT_IN4, HIGH); // LB
+
+  // PHYSICAL RIGHT SIDE (RF + RB) forward
+  digitalWrite(LEFT_IN3, HIGH);  digitalWrite(LEFT_IN4, LOW);   // RF
+  digitalWrite(LEFT_IN1, HIGH);  digitalWrite(LEFT_IN2, LOW);   // RB
+}
+
+// Pivot right: physical LEFT forward, physical RIGHT backward
+void turnRight(int speed) {
+  setMotorSpeed(speed);
+
+  // PHYSICAL LEFT SIDE (LF + LB) forward
+  digitalWrite(RIGHT_IN1, HIGH); digitalWrite(RIGHT_IN2, LOW);  // LF
+  digitalWrite(RIGHT_IN3, HIGH); digitalWrite(RIGHT_IN4, LOW);  // LB
+
+  // PHYSICAL RIGHT SIDE (RF + RB) backward
+  digitalWrite(LEFT_IN3, LOW);   digitalWrite(LEFT_IN4, HIGH);  // RF
+  digitalWrite(LEFT_IN1, LOW);   digitalWrite(LEFT_IN2, HIGH);  // RB
+}
+
+// ================= GAMEPAD CALLBACKS =================
+void onConnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == nullptr) {
+      Serial.println("GAMEPAD CONNECTED!");
+      myControllers[i] = ctl;
+      return;
+    }
+  }
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == ctl) {
+      Serial.println("GAMEPAD DISCONNECTED");
+      myControllers[i] = nullptr;
+      stopAllMotors();
+      return;
+    }
+  }
+}
+
+// ================= GAMEPAD PROCESSING =================
+void processGamepad(ControllerPtr ctl) {
+  int axisRX   = ctl->axisRX();
+  int axisRY   = ctl->axisRY();
+  
+  int axisX    = ctl->axisX();
+  int axisY    = ctl->axisY();
+  uint16_t buttons = ctl->buttons();
+  uint8_t dpad     = ctl->dpad();
+  int throttle     = ctl->throttle();
+  int brake        = ctl->brake();
+
+  // --- MOTOR LOGIC ---
+  bool motorMoving = false;
+  int motorSpeed   = 0;
+
+  // Forward / backward on Y
+  if (axisY < DEADZONE_Y_MIN || axisY > DEADZONE_Y_MAX) {
+    motorSpeed = mapJoystickToSpeed(axisY);
+    if (axisY < DEADZONE_Y_MIN)
+      moveForward(motorSpeed);
+    else
+      moveBackward(motorSpeed);
+    motorMoving = true;
+  }
+  // Pivot turn on X 
+  else if (axisX < DEADZONE_X_MIN || axisX > DEADZONE_X_MAX) {
+    motorSpeed = mapJoystickToSpeed(axisX);
+    if (axisX < DEADZONE_X_MIN)
+      turnLeft(motorSpeed);
+    else
+      turnRight(motorSpeed);
+    motorMoving = true;
+  }
+
+  if (!motorMoving) {
+    stopAllMotors();
+  }
+
+  // --- SERVO LOGIC ---
+  // Base (Right Stick X)
+  if (axisRX < DEADZONE_X_MIN)
+    posBase += SERVO_SPEED;
+  else if (axisRX > DEADZONE_X_MAX)
+    posBase -= SERVO_SPEED;
+
+  // Shoulder (Right Stick Y)
+  if (axisRY < DEADZONE_Y_MIN)
+    posShoulder -= SERVO_SPEED;
+  else if (axisRY > DEADZONE_Y_MAX)
+    posShoulder += SERVO_SPEED;
+
+  // Elbow (RB / RT)
+  if (buttons & 0x0020)                    // RB
+    posElbow -= SERVO_SPEED;
+  else if ((buttons & 0x0080) || throttle > 100)  // RT / analog
+    posElbow += SERVO_SPEED;
+
+  // Wrist (D-Pad Up/Down)
+  if (dpad & 0x01)          // Up
+    posWrist += SERVO_SPEED;
+  else if (dpad & 0x02)     // Down
+    posWrist -= SERVO_SPEED;
+
+  // Gripper (LB / LT)
+  if (buttons & 0x0010)     // LB - close
+    posGripper -= SERVO_SPEED;
+  else if ((buttons & 0x0040) || brake > 100)  // LT / analog
+    posGripper += SERVO_SPEED;
+
+  // Constrain limits
+  posBase     = constrain(posBase, 0, 180);
+  posShoulder = constrain(posShoulder, 0, 180);
+  posElbow    = constrain(posElbow, 0, 180);
+  posWrist    = constrain(posWrist, 0, 180);
+  posGripper  = constrain(posGripper, 0, 180);
+
+  // Write to Servos
+  servoBase.write(posBase);
+  servoShoulder.write(posShoulder);
+  servoElbow.write(posElbow);
+  servoWrist.write(posWrist);
+  servoGripper.write(posGripper);
+
+  // Debug button dpad (every 200 ms)
+  static unsigned long lastDebug = 0;
+  unsigned long now = millis();
+  if (now - lastDebug > 200) {
+    if (buttons || dpad) {
+      Serial.printf("Buttons: 0x%04x | DPad: 0x%02x\n", buttons, dpad);
+    }
+    lastDebug = now;
+  }
+}
+
+void processControllers() {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    ControllerPtr ctl = myControllers[i];
+    if (ctl && ctl->isConnected() && ctl->isGamepad()) {
+      processGamepad(ctl);
+    }
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("Robot Initializing...");
+
+  // Servos
+  servoGripper.attach(PIN_GRIPPER, 500, 2400);
+  servoWrist.attach(PIN_WRIST, 500, 2400);
+  servoElbow.attach(PIN_ELBOW, 500, 2400);
+  servoShoulder.attach(PIN_SHOULDER, 500, 2400);
+  servoBase.attach(PIN_BASE, 500, 2400);
+
+  // Initial neutral positions
+  servoBase.write(posBase);
+  servoShoulder.write(posShoulder);
+  servoElbow.write(posElbow);
+  servoWrist.write(posWrist);
+  servoGripper.write(posGripper);
+
+  // Motor pins
+  pinMode(LEFT_IN1, OUTPUT);  pinMode(LEFT_IN2, OUTPUT);
+  pinMode(LEFT_IN3, OUTPUT);  pinMode(LEFT_IN4, OUTPUT);
+  pinMode(RIGHT_IN1, OUTPUT); pinMode(RIGHT_IN2, OUTPUT);
+  pinMode(RIGHT_IN3, OUTPUT); pinMode(RIGHT_IN4, OUTPUT);
+
+  // PWM channels 
+  ledcSetup(PWM_CHANNEL_LEFT_ENA,  PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(PWM_CHANNEL_LEFT_ENB,  PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(PWM_CHANNEL_RIGHT_ENA, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(PWM_CHANNEL_RIGHT_ENB, PWM_FREQ, PWM_RESOLUTION);
+
+  ledcAttachPin(LEFT_ENA,  PWM_CHANNEL_LEFT_ENA);
+  ledcAttachPin(LEFT_ENB,  PWM_CHANNEL_LEFT_ENB);
+  ledcAttachPin(RIGHT_ENA, PWM_CHANNEL_RIGHT_ENA);
+  ledcAttachPin(RIGHT_ENB, PWM_CHANNEL_RIGHT_ENB);
+
+  stopAllMotors();
+
+  // Bluetooth / Bluepad32
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+  BP32.forgetBluetoothKeys();
+
+  Serial.println("Ready for controller.");
+}
+
+// ================= LOOP =================
+void loop() {
+  bool updated = BP32.update();
+  if (updated) {
+    processControllers();
+  }
+  delay(25);
+}
